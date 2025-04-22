@@ -49,64 +49,102 @@ def ref_attention(q, k, v, pe, ref_config, ref_type, idx, txt_shape=256):
 
 
 class DoubleStreamBlock(OriginalDoubleStreamBlock):
-    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, transformer_options={}):
+    """
+    HiDream’s dual‑stream block:  sub‑layer 1 = text→image heads,
+    sub‑layer 2 = image→image heads.  RF‑Edit now captures **both**:
+
+        rfedit['bank'][step][pred][idx] = {
+            "txt2img": full_v,   # concatenated txt_v + img_v   (old behaviour)
+            "img2img": img_v,    # raw image‑image V‑vectors    (new)
+        }
+    """
+
+    def forward(
+        self,
+        img: Tensor,
+        txt: Tensor,
+        vec: Tensor,
+        pe: Tensor,
+        transformer_options={},
+    ):
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
 
-        # prepare image for attention
-        img_modulated = self.img_norm1(img)
-        img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
+        # ----- pre‑norm & QKV -------------------------------------------------
+        img_modulated = (1 + img_mod1.scale) * self.img_norm1(img) + img_mod1.shift
         img_qkv = self.img_attn.qkv(img_modulated)
-        img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        img_q, img_k, img_v = rearrange(
+            img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads
+        )
         img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
 
-        # prepare txt for attention
-        txt_modulated = self.txt_norm1(txt)
-        txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
+        txt_modulated = (1 + txt_mod1.scale) * self.txt_norm1(txt) + txt_mod1.shift
         txt_qkv = self.txt_attn.qkv(txt_modulated)
-        txt_q, txt_k, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        txt_q, txt_k, txt_v = rearrange(
+            txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads
+        )
         txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
-        # run actual attention
+        # ----- concat streams -------------------------------------------------
         q = torch.cat((txt_q, img_q), dim=2)
         k = torch.cat((txt_k, img_k), dim=2)
         v = torch.cat((txt_v, img_v), dim=2)
 
-        post_q_fn = transformer_options.get('patches_replace', {}).get(f'double', {}).get(('post_q', self.idx), None) 
+        # optional patch hooks
+        post_q_fn = (
+            transformer_options.get("patches_replace", {})
+            .get("double", {})
+            .get(("post_q", self.idx), None)
+        )
         if post_q_fn is not None:
             q = post_q_fn(q, transformer_options)
 
-        # Mask Patch
-        mask_fn = transformer_options.get('patches_replace', {}).get(f'double', {}).get(('mask_fn', self.idx), None) 
-        mask = None
-        if mask_fn is not None:
-            mask = mask_fn(q, transformer_options, txt.shape[1])
+        mask_fn = (
+            transformer_options.get("patches_replace", {})
+            .get("double", {})
+            .get(("mask_fn", self.idx), None)
+        )
+        mask = mask_fn(q, transformer_options, txt.shape[1]) if mask_fn else None
 
-        rfedit = transformer_options.get('rfedit', {})
-        if rfedit.get('process', None) is not None and rfedit['double_layers'][str(self.idx)]:
-            pred = rfedit['pred']
-            step = rfedit['step']
-            if rfedit['process'] == 'forward':
-                rfedit['bank'][step][pred][self.idx] = v.cpu()
-            elif rfedit['process'] == 'reverse' and self.idx in rfedit['bank'][step][pred]:
-                v = rfedit['bank'][step][pred][self.idx].to(v.device)
+        # ----- RF‑Edit save / inject -----------------------------------------
+        rfedit = transformer_options.get("rfedit", {})
+        if rfedit and rfedit["double_layers"].get(str(self.idx), False):
+            step  = rfedit["step"]
+            pred  = rfedit["pred"]
+            bank  = rfedit["bank"][step][pred]
 
+            if rfedit["process"] == "forward":
+                # save both heads
+                bank[self.idx] = {
+                    "txt2img": v.cpu(),   # full concatenated V
+                    "img2img": img_v.cpu(),
+                }
+            elif rfedit["process"] == "reverse" and self.idx in bank:
+                stored = bank[self.idx]
+                # restore txt→img head (full V) and img→img head separately
+                v      = stored["txt2img"].to(v.device)
+                img_v  = stored["img2img"].to(img_v.device)
+
+        # ----- attention ------------------------------------------------------
         attn = attention(q, k, v, pe=pe, mask=mask)
-
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
 
-        # calculate the img bloks
+        # ----- residual & MLP -------------------------------------------------
         img = img + img_mod1.gate * self.img_attn.proj(img_attn)
-        img = img + img_mod2.gate * self.img_mlp((1 + img_mod2.scale) * self.img_norm2(img) + img_mod2.shift)
+        img = img + img_mod2.gate * self.img_mlp(
+            (1 + img_mod2.scale) * self.img_norm2(img) + img_mod2.shift
+        )
 
-        # calculate the txt bloks
         txt = txt + txt_mod1.gate * self.txt_attn.proj(txt_attn)
-        txt = txt + txt_mod2.gate * self.txt_mlp((1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift)
+        txt = txt + txt_mod2.gate * self.txt_mlp(
+            (1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift
+        )
 
         if txt.dtype == torch.float16:
             txt = torch.nan_to_num(txt, nan=0.0, posinf=65504, neginf=-65504)
 
         return img, txt
+
 
 
 class SingleStreamBlock(OriginalSingleStreamBlock):

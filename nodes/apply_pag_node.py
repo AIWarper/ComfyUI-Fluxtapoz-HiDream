@@ -35,23 +35,29 @@ class PAGAttentionNode:
     def patch(self, model, scale, attn_override=DEFAULT_PAG_FLUX, rescale=0):
         m = model.clone()
 
-        def pag_mask(q, extra_options, txt_size=256):
-            # From diffusers implementation
-            identity_block_size = q.shape[1] - txt_size
-            # create a full mask with all entries set to 0
-            seq_len = q.size(2)
-            full_mask = torch.zeros((seq_len, seq_len), device=q.device, dtype=q.dtype)
+        # ---- new PAG mask that auto‑detects text length ----
+        def pag_mask(q, extra_options, txt_size=None):
+            """
+            HiDream concatenates 2 458 text tokens; Flux uses 256.
+            We read the count from `extra_options["clip_token_count"]`
+            (added by the 22‑Apr‑2025 HiDream commit) and fall back to 256
+            so the same file still works with Flux.
+            """
+            if txt_size is None:
+                txt_size = extra_options.get("clip_token_count", 256)
 
-            # set the attention value between image patches to -inf
-            full_mask[:identity_block_size, :identity_block_size] = float("-inf")
+            seq_len       = q.size(2)                      # total tokens
+            img_tokens    = seq_len - txt_size             # first part is image
 
-            # set the diagonal of the attention value between image patches to 0
-            full_mask[:identity_block_size, :identity_block_size].fill_diagonal_(0)
+            full_mask = torch.zeros((seq_len, seq_len),
+                                    device=q.device,
+                                    dtype=q.dtype)
+            # block ⇆ block attention inside image region
+            full_mask[:img_tokens, :img_tokens] = float("-inf")
+            full_mask[:img_tokens, :img_tokens].fill_diagonal_(0)
 
-            # expand the mask to match the attention weights shape
-            full_mask = full_mask.unsqueeze(0).unsqueeze(0)  # Add batch and num_heads dimensions
-
-            return full_mask
+            # add batch + head dimensions expected by ComfyUI
+            return full_mask.unsqueeze(0).unsqueeze(0)
 
         def post_cfg_function(args):
             model = args["model"]

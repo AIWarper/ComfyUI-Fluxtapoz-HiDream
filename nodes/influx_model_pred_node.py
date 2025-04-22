@@ -37,13 +37,16 @@ class InFluxModelSamplingPredNode:
     def patch(self, model, max_shift, base_shift, width, height):
         m = model.clone()
 
-        x1 = 256
-        x2 = 4096
+        # --- swap the fixed 256 for the model’s real token count ---
+        clip_tokens = getattr(model, "clip_token_count", 256)
+
+        x1 = clip_tokens      # was 256
+        x2 = 4096             # image‑token upper bound stays the same
         mm = (max_shift - base_shift) / (x2 - x1)
         b = base_shift - mm * x1
         shift = (width * height / (8 * 8 * 2 * 2)) * mm + b
 
-        sampling_base = comfy.model_sampling.ModelSamplingFlux
+        sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow
         sampling_type = InverseCONST
 
         class ModelSamplingAdvanced(sampling_base, sampling_type):
@@ -104,13 +107,16 @@ class OutFluxModelSamplingPredNode:
     def patch(self, model, max_shift, base_shift, width, height, reverse_ode=False):
         m = model.clone()
 
-        x1 = 256
-        x2 = 4096
+        # --- swap the fixed 256 for the model’s real token count ---
+        clip_tokens = getattr(model, "clip_token_count", 256)
+
+        x1 = clip_tokens      # was 256
+        x2 = 4096             # image‑token upper bound stays the same
         mm = (max_shift - base_shift) / (x2 - x1)
         b = base_shift - mm * x1
         shift = (width * height / (8 * 8 * 2 * 2)) * mm + b
 
-        sampling_base = comfy.model_sampling.ModelSamplingFlux
+        sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow
         if reverse_ode:
             sampling_type = ReverseCONST
         else:

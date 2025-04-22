@@ -64,90 +64,127 @@ class CreateRegionalCondNode:
 
 class ApplyRegionalCondsNode:
     @classmethod
-    def INPUT_TYPES(s):
-        return {"required": { 
-            "model": ("MODEL",),
-            "region_conds": ("REGION_COND",),
-            "latent": ("LATENT",),
-            "start_percent": ("FLOAT", {"default": 0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.01}),
-            "end_percent": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.01}),
-        }, "optional": {
-            "attn_override": ("ATTN_OVERRIDE",)
-        }}
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model":      ("MODEL",),
+                "region_conds": ("REGION_COND",),
+                "latent":     ("LATENT",),
+                "start_percent": ("FLOAT", {"default": 0,   "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.01}),
+                "end_percent":   ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.01}),
+            },
+            "optional": {
+                "attn_override": ("ATTN_OVERRIDE",),
+            },
+        }
 
     RETURN_TYPES = ("MODEL",)
-    FUNCTION = "patch"
+    FUNCTION     = "patch"
+    CATEGORY     = "fluxtapoz"
 
-    CATEGORY = "fluxtapoz"
-
-    def patch(self, model, region_conds, latent, start_percent, end_percent, attn_override=DEFAULT_REGIONAL_ATTN):
+    def patch(
+        self,
+        model,
+        region_conds,
+        latent,
+        start_percent,
+        end_percent,
+        attn_override=DEFAULT_REGIONAL_ATTN,
+    ):
+        # --------------------------------------------------------------------
+        # 1. Clone the model so we can patch it without side‑effects
+        # --------------------------------------------------------------------
         model = model.clone()
 
-        latent = latent['samples']
+        # --------------------------------------------------------------------
+        # 2. Derive dimensions
+        # --------------------------------------------------------------------
+        latent  = latent["samples"]                     # BCHW
         b, c, h, w = latent.shape
-        h //=2
-        w //=2
+        h //= 2                                         # Fluxtapoz uses /2 latents
+        w //= 2
+        img_len = h * w
 
-        img_len = h*w
+        # --------------------------------------------------------------------
+        # 3. HiDream vs Flux: work out how many text tokens exist
+        #    HiDream exposes clip_token_count (2 458), Flux falls back to 256
+        # --------------------------------------------------------------------
+        clip_tokens = getattr(model, "clip_token_count", 256)  # ★ NEW ★
 
-        regional_conditioning = torch.cat([region_cond['cond'] for region_cond in region_conds], dim=1)
-        text_len = 256 + regional_conditioning.shape[1]
+        # --------------------------------------------------------------------
+        # 4. Concat all regional text embeddings and build the attention mask
+        # --------------------------------------------------------------------
+        regional_conditioning = torch.cat(
+            [rc["cond"] for rc in region_conds], dim=1
+        )                                              # (1, R, 4096)
 
-        regional_mask = torch.zeros((text_len + img_len, text_len + img_len), dtype=torch.bool)
+        text_len = clip_tokens + regional_conditioning.shape[1]
 
+        regional_mask = torch.zeros(
+            (text_len + img_len, text_len + img_len), dtype=torch.bool
+        )
+
+        # helpers for image‑image masking
         self_attend_masks = torch.zeros((img_len, img_len), dtype=torch.bool)
-        union_masks = torch.zeros((img_len, img_len), dtype=torch.bool)
+        union_masks       = torch.zeros((img_len, img_len), dtype=torch.bool)
 
+        # --------------------------------------------------------------------
+        # 5. Prepend a “global” region that covers the whole image
+        #    Its cond tensor must match the REAL clip_token length
+        # --------------------------------------------------------------------
         region_conds = [
-            { 
-                'mask': torch.ones((1, h, w), dtype=torch.float16),
-                'cond': torch.ones((1, 256, 4096), dtype=torch.float16)
+            {
+                "mask": torch.ones((1, h, w), dtype=torch.float16),
+                "cond": torch.ones((1, clip_tokens, 4096), dtype=torch.float16),  # ★ NEW ★
             },
-            *region_conds
+            *region_conds,
         ]
 
+        # --------------------------------------------------------------------
+        # 6. Fill the big attention‑mask matrix
+        # --------------------------------------------------------------------
         current_seq_len = 0
-        for region_cond_dict in region_conds:
-            region_cond = region_cond_dict['cond']
-            region_mask = 1 - region_cond_dict['mask'][0]
-            region_mask = torch.nn.functional.interpolate(region_mask[None, None, :, :], (h, w), mode='nearest-exact').flatten().unsqueeze(1).repeat(1, region_cond.size(1))
-            next_seq_len = current_seq_len + region_cond.shape[1]
+        for rc in region_conds:
+            cond_tokens  = rc["cond"].shape[1]
+            next_seq_len = current_seq_len + cond_tokens
 
-            # txt attends to itself
+            region_mask  = 1 - rc["mask"][0]                               # (H,W)
+            region_mask  = torch.nn.functional.interpolate(
+                region_mask[None, None, :, :], (h, w), mode="nearest-exact"
+            ).flatten().unsqueeze(1).repeat(1, cond_tokens)
+
+            # txt ↔ txt
             regional_mask[current_seq_len:next_seq_len, current_seq_len:next_seq_len] = True
-
-            # txt attends to corresponding regional img
-            regional_mask[current_seq_len:next_seq_len, text_len:] = region_mask.transpose(-1, -2)
-
-            # regional img attends to corresponding txt
+            # txt → img
+            regional_mask[current_seq_len:next_seq_len, text_len:] = region_mask.T
+            # img → txt
             regional_mask[text_len:, current_seq_len:next_seq_len] = region_mask
 
-            # regional img attends to corresponding regional img
-            img_size_masks = region_mask[:, :1].repeat(1, img_len)
-            img_size_masks_transpose = img_size_masks.transpose(-1, -2)
-            self_attend_masks = torch.logical_or(self_attend_masks, 
-                                                    torch.logical_and(img_size_masks, img_size_masks_transpose))
+            # img ↔ img (self/union helpers)
+            mask_full            = region_mask[:, :1].repeat(1, img_len)
+            mask_full_T          = mask_full.T
+            self_attend_masks    |= mask_full & mask_full_T
+            union_masks          |= mask_full | mask_full_T
 
-            # update union
-            union_masks = torch.logical_or(union_masks, 
-                                            torch.logical_or(img_size_masks, img_size_masks_transpose))
-            
             current_seq_len = next_seq_len
 
-        background_masks = torch.logical_not(union_masks)
-        background_and_self_attend_masks = torch.logical_or(background_masks, self_attend_masks)
-        regional_mask[text_len:, text_len:] = background_and_self_attend_masks
+        # everything else attends to its background
+        background_masks = ~union_masks
+        regional_mask[text_len:, text_len:] = background_masks | self_attend_masks
 
-        # Patch
-        regional_mask = RegionalMask(regional_mask, start_percent, end_percent)
+        # --------------------------------------------------------------------
+        # 7. Wrap masks/conds in Fluxtapoz helper classes & patch model
+        # --------------------------------------------------------------------
+        regional_mask         = RegionalMask(regional_mask, start_percent, end_percent)
         regional_conditioning = RegionalConditioning(regional_conditioning, start_percent, end_percent)
 
-        model.set_model_patch(regional_conditioning, 'regional_conditioning')
+        model.set_model_patch(regional_conditioning, "regional_conditioning")
 
-        for block_idx in attn_override['double']:
-            model.set_model_patch_replace(regional_mask, f"double", "mask_fn", int(block_idx))
-
-        for block_idx in attn_override['single']:
-            model.set_model_patch_replace(regional_mask, f"single", "mask_fn", int(block_idx))
+        # override attention blocks
+        for idx in attn_override["double"]:
+            model.set_model_patch_replace(regional_mask, "double", "mask_fn", int(idx))
+        for idx in attn_override["single"]:
+            model.set_model_patch_replace(regional_mask, "single", "mask_fn", int(idx))
 
         return (model,)
+

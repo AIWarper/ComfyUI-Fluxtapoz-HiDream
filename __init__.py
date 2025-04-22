@@ -22,6 +22,8 @@ from .nodes.regional_cond_nodes import ApplyRegionalCondsNode, CreateRegionalCon
 from .nodes.redux_apply_node import RegionalStyleModelApplyNode
 # General
 from .nodes.attn_override_node import FluxAttnOverrideNode, RFSingleBlocksOverrideNode, RFDoubleBlocksOverrideNode
+from .nodes.peek_sigmas_node import PeekSigmasNode
+from .nodes.configure_hidream_blocks_node import ConfigureHiDreamBlocksNode
 
 
 NODE_CLASS_MAPPINGS = {
@@ -57,7 +59,9 @@ NODE_CLASS_MAPPINGS = {
     ## Regional
     "ApplyRegionalConds": ApplyRegionalCondsNode,
     "CreateRegionalCond": CreateRegionalCondNode,
-    "RegionalStyleModelApply": RegionalStyleModelApplyNode
+    "RegionalStyleModelApply": RegionalStyleModelApplyNode,
+    "PeekSigmas": PeekSigmasNode,
+    "ConfigureHiDreamBlocks": ConfigureHiDreamBlocksNode
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -94,5 +98,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ApplyRegionalConds": "Apply Flux Regional Conds",
     "CreateRegionalCond": "Create Flux Regional Cond",
     "RegionalStyleModelApply": "Regional Style Model Apply",
+    "PeekSigmas": "Peek Sigmas",
+    "ConfigureHiDreamBlocks": "Configure HiDream Blocks",
 }
 

@@ -58,15 +58,19 @@ class SEGAttentionNode:
     def patch(self, model, scale, blur, inf_blur, attn_override=DEFAULT_SEG_FLUX):
         m = model.clone()
 
-        def seg_attention(q, extra_options, txt_shape=256):
+        def seg_attention(q, extra_options, txt_shape=None):
+            if txt_shape is None:
+                txt_shape = extra_options.get("clip_token_count", 256)
+
             _, _, sequence_length, _ = q.shape
-            shape = extra_options['original_shape']
-            patch_size = extra_options['patch_size']
-            oh, ow = shape[-2:]
-            h = oh // patch_size
-            q_img = q[:, :, txt_shape:]
-            num_heads = q_img.shape[1]
-            q_img = rearrange(q_img, 'b a (h w) d -> b (a d) w h', h=h)
+            shape       = extra_options["original_shape"]
+            patch_size  = extra_options["patch_size"]
+            oh, ow      = shape[-2:]
+            h           = oh // patch_size
+
+            q_img   = q[:, :, txt_shape:]                       # isolate image tokens
+            n_heads = q_img.shape[1]
+            q_img   = rearrange(q_img, "b a (h w) d -> b (a d) w h", h=h)
             if not inf_blur:
                 kernel_size = math.ceil(6 * blur) + 1 - math.ceil(6 * blur) % 2
                 q_img = gaussian_blur_2d(q_img, kernel_size, blur)
